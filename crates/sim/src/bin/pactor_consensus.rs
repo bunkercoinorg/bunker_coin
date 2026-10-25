@@ -107,7 +107,7 @@ struct Args {
     #[arg(long)]
     duration: Option<u64>,
 
-    /// Serve the HTTP RPC API on 127.0.0.1:3001.
+    /// Serve the HTTP RPC API on `BUNKER_RPC_ADDR` (default 127.0.0.1:3001).
     #[arg(long)]
     rpc: bool,
 
@@ -468,7 +468,6 @@ fn rpc_state_for(
 
 /// Spawn RPC for the simulated, non-reconnect path.
 fn spawn_rpc(blockstore: SharedBlockstore, pool: Option<SharedPool>, tx: &TxContext) {
-    println!("RPC API serving on http://127.0.0.1:3001 (try /blocks, POST /transactions)");
     tokio::spawn(rpc::run_api(rpc_state_for(blockstore, pool, tx)));
 }
 
@@ -614,7 +613,16 @@ fn spawn_block_executor(
                     core_txs.len()
                 );
 
-                record_tx_results(&tx, slot, &block_hash_hex, &core_txs, &results).await;
+                rpc::record_tx_results(
+                    &tx.mempool,
+                    &tx.tx_results,
+                    &tx.tx_results_order,
+                    slot,
+                    &block_hash_hex,
+                    &core_txs,
+                    &results,
+                )
+                .await;
             }
             drop(bs);
             last_executed = batch_end;
@@ -641,55 +649,6 @@ fn decode_block_txs(raw: &[Transaction]) -> Vec<CoreTransaction> {
                 .map(|(tx, _)| tx)
         })
         .collect()
-}
-
-/// Record one finalized slot's transaction results for RPC lookup.
-async fn record_tx_results(
-    tx: &TxContext,
-    slot: u64,
-    block_hash_hex: &str,
-    core_txs: &[CoreTransaction],
-    results: &[Result<(), bunker_coin_core::execution::ExecutionError>],
-) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    /// FIFO cap: old `/tx/{hash}` results age out before the RocksDB chain.
-    const MAX_TX_RESULTS: usize = 10_000;
-
-    let mut mempool = tx.mempool.write().await;
-    let mut results_map = tx.tx_results.write().await;
-    let mut results_order = tx.tx_results_order.write().await;
-    for (core_tx, exec_result) in core_txs.iter().zip(results.iter()) {
-        let hash = hex::encode(core_tx.hash());
-        let (status, error) = match exec_result {
-            Ok(()) => (rpc::TxFinalStatus::Finalized, None),
-            Err(e) => (rpc::TxFinalStatus::Failed, Some(e.to_string())),
-        };
-        // First execution wins: duplicate inclusions fail on nonce and must not
-        // clobber an earlier successful result.
-        if !results_map.contains_key(&hash) {
-            results_map.insert(
-                hash.clone(),
-                rpc::TxResult {
-                    hash: hash.clone(),
-                    slot,
-                    block_hash: block_hash_hex.to_string(),
-                    status,
-                    error,
-                    executed_at: now,
-                },
-            );
-            results_order.push_back(hash.clone());
-            while results_order.len() > MAX_TX_RESULTS {
-                if let Some(oldest) = results_order.pop_front() {
-                    results_map.remove(&oldest);
-                }
-            }
-        }
-        mempool.retain(|e| e.hash != hash);
-    }
 }
 
 /// Native balance credited to the genesis account for client transfers.
@@ -967,10 +926,7 @@ async fn run_inspect(
         bunkerglow::consensus::BlockstoreImpl::new(epoch_info, votor_tx),
     )));
 
-    println!(
-        "=== inspect: serving node {own_id}'s on-disk chain (data/blockstore/{own_id}) ===\n\
-         RPC API on http://127.0.0.1:3001 — try /blocks or /block/slot/1"
-    );
+    println!("=== inspect: serving node {own_id}'s on-disk chain (data/blockstore/{own_id}) ===");
     // Offline inspect has no tx bridge; `/submit` is a no-op.
     let exec = Arc::new(tokio::sync::RwLock::new(cluster.genesis_state()));
     let (tx_ctx, _tx_rx) = TxContext::new(&cluster, exec);
@@ -1213,6 +1169,8 @@ async fn run_hardware(
     let overall_deadline = deadline_for(duration);
     let mut highest = 0u64;
     let mut session = 0u32;
+    // Last session's executed state; the new session's is still catching up.
+    let mut last_exec = base_tx.execution_state.clone();
 
     while tokio::time::Instant::now() < overall_deadline && !shutdown_requested() {
         session += 1;
@@ -1261,6 +1219,17 @@ async fn run_hardware(
 
         // Publish the live mempool for the long-lived RPC bridge.
         *mempool_slot.write().await = Some(mempool.clone());
+        let replayed = rpc::replay_in_flight(
+            &base_tx.mempool,
+            &base_tx.tx_results,
+            &last_exec,
+            &base_tx.tx_sender,
+        )
+        .await;
+        if replayed > 0 {
+            println!("[{label}] replayed {replayed} in-flight tx(s) into the new mempool");
+        }
+        last_exec = exec.clone();
 
         // Rebuild execution by replaying persisted finalized blocks into fresh genesis.
         let session_tx = base_tx.with_execution_state(exec);
@@ -1284,11 +1253,6 @@ async fn run_hardware(
         } else {
             None
         };
-        if rpc_task.is_some() {
-            println!(
-                "[{label}] RPC API on http://127.0.0.1:3001 (try /blocks, POST /transactions)"
-            );
-        }
 
         let (slot, stop) = run_node(
             &label,

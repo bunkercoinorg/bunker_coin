@@ -426,6 +426,8 @@ Blocks and skip certificates progress through these statuses:
 - `finalized` — the block is finalized and immutable
 
 ## CORS Policy
-The API allows cross-origin requests from:
-- Any `http://localhost` port
-- Any subdomain of `*.bunkercoin.io`
+The API allows cross-origin requests from exact origins only:
+- `https://bunkercoin.com` and `https://{www,wallet,explorer,app}.bunkercoin.com`
+- `https://bunkercoin.io` and its `https://*.bunkercoin.io` subdomains (default port)
+- `http://localhost` and `http://127.0.0.1`, any port
+- Each origin listed in `BUNKER_CORS_ORIGINS` (comma-separated, exact match)

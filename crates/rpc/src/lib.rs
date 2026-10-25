@@ -8,7 +8,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use bunker_coin_core::execution::State as ExecutionState;
+use bunker_coin_core::execution::{ExecutionError, State as ExecutionState};
 use bunker_coin_core::transaction::{Transaction as CoreTransaction, TransactionBody};
 use bunker_coin_core::types::MAX_TICKER_LEN;
 use bunkerglow::consensus::{Blockstore, Pool};
@@ -19,7 +19,7 @@ use bunkerglow::Slot;
 use ed25519_dalek::SigningKey;
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -212,6 +212,9 @@ pub struct MempoolEntry {
     pub body_type: String,
     pub body: TransactionBodyResponse,
     pub received_at: u64,
+    /// Signed form, kept so a replaced node mempool can be refilled.
+    #[serde(skip)]
+    pub tx: CoreTransaction,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -364,6 +367,7 @@ pub struct SharedState {
     pub updates: broadcast::Sender<WebSocketUpdate>,
     pub blockstore: Option<Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>>,
     pub pool: Option<Arc<RwLock<Box<dyn Pool + Send + Sync>>>>,
+    /// Lock order wherever held together: blockstore, mempool, tx_results, execution_state.
     pub mempool: Arc<RwLock<Vec<MempoolEntry>>>,
     pub tx_sender: Option<mpsc::UnboundedSender<CoreTransaction>>,
     pub execution_state: Arc<RwLock<ExecutionState>>,
@@ -695,15 +699,22 @@ async fn submit_transaction(
         signature,
     };
 
-    // Zero-signature genesis txs are signed server-side after filling the current nonce.
+    // Held until the entry is pushed so concurrent server-signed txs get distinct nonces.
+    let mut mempool = state.mempool.write().await;
+
+    // Zero-signature genesis txs are signed server-side with the next pending nonce.
     if tx.signature == [0u8; 64] {
         if let Some(sk) = &state.genesis_signing_key {
             let genesis_pk = sk.verifying_key().to_bytes();
             if tx.sender == genesis_pk {
-                let exec = state.execution_state.read().await;
-                let current_nonce = exec.get_account(&genesis_pk).map(|a| a.nonce).unwrap_or(0);
-                drop(exec);
-                tx.nonce = current_nonce;
+                let finalized_nonce = state
+                    .execution_state
+                    .read()
+                    .await
+                    .get_account(&genesis_pk)
+                    .map(|a| a.nonce)
+                    .unwrap_or(0);
+                tx.nonce = pending_nonce(finalized_nonce, &genesis_pk, &mempool, now_ms());
 
                 use ed25519_dalek::Signer;
                 let msg = tx.signing_hash();
@@ -716,7 +727,6 @@ async fn submit_transaction(
     let body_type = body_type_name(&tx.body);
 
     {
-        let mempool = state.mempool.read().await;
         if mempool.iter().any(|e| e.hash == hash) {
             return (
                 axum::http::StatusCode::CONFLICT,
@@ -735,10 +745,7 @@ async fn submit_transaction(
         }
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
+    let now = now_ms();
 
     let entry = MempoolEntry {
         hash: hash.clone(),
@@ -748,13 +755,15 @@ async fn submit_transaction(
         body_type: body_type.to_string(),
         body: core_tx_to_body_response(&tx.body),
         received_at: now,
+        tx: tx.clone(),
     };
 
-    state.mempool.write().await.push(entry);
+    mempool.push(entry);
 
     if let Some(tx_sender) = &state.tx_sender {
         let _ = tx_sender.send(tx);
     }
+    drop(mempool);
 
     let _ = state.updates.send(WebSocketUpdate::TransactionReceived {
         hash: hash.clone(),
@@ -764,6 +773,119 @@ async fn submit_transaction(
     });
 
     Json(serde_json::json!({ "hash": hash })).into_response()
+}
+
+/// Entries older than this no longer hold their nonce: reconnects drop the node
+/// mempool without clearing RPC entries, and a lost tx must not wedge the sender.
+const IN_FLIGHT_NONCE_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// Lowest nonce at or past `finalized_nonce` that no recent in-flight tx of `sender` holds.
+fn pending_nonce(
+    finalized_nonce: u64,
+    sender: &[u8; 32],
+    mempool: &[MempoolEntry],
+    now_ms: u64,
+) -> u64 {
+    let held: HashSet<u64> = mempool
+        .iter()
+        .filter(|e| now_ms.saturating_sub(e.received_at) < IN_FLIGHT_NONCE_TTL_MS)
+        .filter(|e| decode_pubkey(&e.sender).is_ok_and(|pk| &pk == sender))
+        .map(|e| e.nonce)
+        .collect();
+    (finalized_nonce..)
+        .find(|n| !held.contains(n))
+        .unwrap_or(finalized_nonce)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Drop entries that finalized or whose nonce the sender already consumed, and
+/// return the survivors' signed txs in nonce order.
+fn prune_for_replay(
+    pool: &mut Vec<MempoolEntry>,
+    finalized: &HashMap<String, TxResult>,
+    account_nonce: impl Fn(&[u8; 32]) -> u64,
+) -> Vec<CoreTransaction> {
+    pool.retain(|e| !finalized.contains_key(&e.hash) && e.nonce >= account_nonce(&e.tx.sender));
+    let mut survivors: Vec<&MempoolEntry> = pool.iter().collect();
+    survivors.sort_by_key(|e| (e.nonce, e.received_at));
+    survivors.into_iter().map(|e| e.tx.clone()).collect()
+}
+
+/// Resubmit in-flight txs into a replaced node mempool (a reconnect drops the old one),
+/// so a lost tx cannot leave later nonces of its sender unexecutable. `execution_state`
+/// is the last state that executed the chain. Holds the mempool lock throughout so no
+/// faucet tx is signed mid-replay. Returns the number of txs resubmitted.
+pub async fn replay_in_flight(
+    mempool: &RwLock<Vec<MempoolEntry>>,
+    tx_results: &RwLock<HashMap<String, TxResult>>,
+    execution_state: &RwLock<ExecutionState>,
+    tx_sender: &mpsc::UnboundedSender<CoreTransaction>,
+) -> usize {
+    let mut pool = mempool.write().await;
+    let txs = {
+        let results = tx_results.read().await;
+        let exec = execution_state.read().await;
+        prune_for_replay(&mut pool, &results, |pk| {
+            exec.get_account(pk).map_or(0, |a| a.nonce)
+        })
+    };
+    for tx in &txs {
+        let _ = tx_sender.send(tx.clone());
+    }
+    txs.len()
+}
+
+/// FIFO cap: old `/tx/{hash}` results age out before the RocksDB chain.
+const MAX_TX_RESULTS: usize = 10_000;
+
+/// Record one finalized slot's execution results and drop those txs from the mempool.
+pub async fn record_tx_results(
+    mempool: &RwLock<Vec<MempoolEntry>>,
+    tx_results: &RwLock<HashMap<String, TxResult>>,
+    results_order: &RwLock<VecDeque<String>>,
+    slot: u64,
+    block_hash_hex: &str,
+    core_txs: &[CoreTransaction],
+    results: &[Result<(), ExecutionError>],
+) {
+    let now = now_ms();
+    let mut mempool = mempool.write().await;
+    let mut results_map = tx_results.write().await;
+    let mut results_order = results_order.write().await;
+    for (core_tx, exec_result) in core_txs.iter().zip(results.iter()) {
+        let hash = hex::encode(core_tx.hash());
+        let (status, error) = match exec_result {
+            Ok(()) => (TxFinalStatus::Finalized, None),
+            Err(e) => (TxFinalStatus::Failed, Some(e.to_string())),
+        };
+        // First execution wins: duplicate inclusions fail on nonce and must not
+        // clobber an earlier successful result.
+        if !results_map.contains_key(&hash) {
+            results_map.insert(
+                hash.clone(),
+                TxResult {
+                    hash: hash.clone(),
+                    slot,
+                    block_hash: block_hash_hex.to_string(),
+                    status,
+                    error,
+                    executed_at: now,
+                },
+            );
+            results_order.push_back(hash.clone());
+            while results_order.len() > MAX_TX_RESULTS {
+                if let Some(oldest) = results_order.pop_front() {
+                    results_map.remove(&oldest);
+                }
+            }
+        }
+        mempool.retain(|e| e.hash != hash);
+    }
 }
 
 async fn mempool(
@@ -1125,48 +1247,51 @@ async fn get_transaction(
     Path(hash): Path<String>,
     state: axum::extract::State<SharedState>,
 ) -> impl IntoResponse {
-    {
+    let (finalized, pending) = {
+        let pool = state.mempool.read().await;
         let results = state.tx_results.read().await;
-        if let Some(result) = results.get(&hash) {
-            let (sender, nonce, fee, body) = find_tx_details_in_blockstore(&state, &hash)
-                .await
-                .unwrap_or_else(|| ("unknown".to_string(), 0, 0, None));
-
-            let success = matches!(result.status, TxFinalStatus::Finalized);
-            let mut resp = serde_json::json!({
-                "hash": hash,
-                "sender": sender,
-                "nonce": nonce,
-                "fee": fee,
-                "status": {
-                    "location": "finalized",
-                    "slot": result.slot,
-                    "block_hash": result.block_hash,
-                    "executed": true,
-                    "success": success,
-                    "error": result.error,
-                },
-            });
-            if let Some(body_resp) = body {
-                resp["body"] = serde_json::to_value(body_resp).unwrap_or_default();
-            }
-            return Json(resp).into_response();
+        match results.get(&hash) {
+            Some(r) => (Some(r.clone()), None),
+            None => (None, pool.iter().find(|e| e.hash == hash).cloned()),
         }
+    };
+
+    if let Some(result) = finalized {
+        let (sender, nonce, fee, body) = find_tx_details_in_blockstore(&state, &hash)
+            .await
+            .unwrap_or_else(|| ("unknown".to_string(), 0, 0, None));
+
+        let success = matches!(result.status, TxFinalStatus::Finalized);
+        let mut resp = serde_json::json!({
+            "hash": hash,
+            "sender": sender,
+            "nonce": nonce,
+            "fee": fee,
+            "status": {
+                "location": "finalized",
+                "slot": result.slot,
+                "block_hash": result.block_hash,
+                "executed": true,
+                "success": success,
+                "error": result.error,
+            },
+        });
+        if let Some(body_resp) = body {
+            resp["body"] = serde_json::to_value(body_resp).unwrap_or_default();
+        }
+        return Json(resp).into_response();
     }
 
-    {
-        let pool = state.mempool.read().await;
-        if let Some(entry) = pool.iter().find(|e| e.hash == hash) {
-            return Json(serde_json::json!({
-                "hash": entry.hash,
-                "sender": entry.sender,
-                "nonce": entry.nonce,
-                "fee": entry.fee,
-                "body": entry.body,
-                "status": { "location": "mempool" },
-            }))
-            .into_response();
-        }
+    if let Some(entry) = pending {
+        return Json(serde_json::json!({
+            "hash": entry.hash,
+            "sender": entry.sender,
+            "nonce": entry.nonce,
+            "fee": entry.fee,
+            "body": entry.body,
+            "status": { "location": "mempool" },
+        }))
+        .into_response();
     }
 
     if let Some((sender, nonce, fee, body, slot_u64, blk_hash)) =
@@ -1203,10 +1328,9 @@ async fn list_transactions(
     let mut txs: Vec<serde_json::Value> = Vec::new();
 
     if let Some(bs_arc) = &state.blockstore {
+        let highest_finalized_slot = current_slot(&state).await;
         let bs = bs_arc.read().await;
         let results = state.tx_results.read().await;
-
-        let highest_finalized_slot = current_slot(&state).await;
 
         // Scan newest-first, bounded by page need and a fixed recent window.
         let need = offset + limit;
@@ -2926,6 +3050,421 @@ mod tests {
             _ => panic!("expected a block entry"),
         }
     }
+
+    #[test]
+    fn cors_accepts_only_exact_bunkercoin_and_loopback_origins() {
+        let extra = cors_extra_origins(" https://staging.example.org/ ,,http://10.0.0.5:8080");
+        assert_eq!(
+            extra,
+            vec!["https://staging.example.org", "http://10.0.0.5:8080"]
+        );
+        for ok in [
+            "https://bunkercoin.com",
+            "https://www.bunkercoin.com",
+            "https://wallet.bunkercoin.com",
+            "https://explorer.bunkercoin.com",
+            "https://app.bunkercoin.com",
+            "https://bunkercoin.io",
+            "https://explorer.bunkercoin.io",
+            "https://a.b.bunkercoin.io",
+            "http://localhost",
+            "http://localhost:3000",
+            "http://127.0.0.1:5173",
+            "https://staging.example.org",
+            "http://10.0.0.5:8080",
+        ] {
+            assert!(cors_origin_allowed(ok, &extra), "{ok} should be allowed");
+        }
+        for bad in [
+            "http://localhost.evil.example",
+            "http://localhost.evil.example:3000",
+            "http://localhost:",
+            "http://localhost:99999",
+            "http://user@localhost",
+            "https://localhost",
+            "http://127.0.0.1.evil.example",
+            "http://bunkercoin.com",
+            "https://evil.bunkercoin.com",
+            "https://bunkercoin.com.evil.example",
+            "https://evilbunkercoin.io",
+            "http://explorer.bunkercoin.io",
+            "https://explorer.bunkercoin.io:8443",
+            "https://a..bunkercoin.io",
+            "https://evil.example/.bunkercoin.io",
+            "https://staging.example.org.evil",
+            "null",
+            "",
+        ] {
+            assert!(
+                !cors_origin_allowed(bad, &extra),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    fn mempool_entry(sender: String, nonce: u64) -> MempoolEntry {
+        let tx = CoreTransaction {
+            sender: decode_pubkey(&sender).unwrap_or([0u8; 32]),
+            nonce,
+            ..make_core_tx(TransactionBody::Transfer {
+                to: [0x01; 32],
+                amount: 1,
+            })
+        };
+        MempoolEntry {
+            hash: format!("{sender}-{nonce}"),
+            tx,
+            sender,
+            nonce,
+            fee: 0,
+            body_type: "Transfer".into(),
+            body: TransactionBodyResponse::Transfer {
+                to: String::new(),
+                amount: 0,
+            },
+            received_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn signature_statuses_report_in_flight_txs_without_a_fake_slot() {
+        let queued = make_core_tx(TransactionBody::Transfer {
+            to: [0x01; 32],
+            amount: 1,
+        });
+        let included = CoreTransaction {
+            nonce: 2,
+            ..queued.clone()
+        };
+        let zeros = vec![0u8; 32];
+        let blk: bunkerglow::Block = serde_json::from_value(serde_json::json!({
+            "slot": 42,
+            "hash": zeros,
+            "parent": 41,
+            "parent_hash": zeros,
+            "epoch_transition": null,
+            "transactions": [encode_core_tx(&included)],
+        }))
+        .unwrap();
+        let mut bs = bunkerglow::consensus::MockBlockstore::new();
+        bs.expect_canonical_block_hash()
+            .returning(|s| (s.inner() == 42).then(|| Hash::from([0u8; 32])));
+        bs.expect_get_block().returning(move |_| Some(blk.clone()));
+
+        let mut state = test_state(Vec::new());
+        state.blockstore = Some(Arc::new(tokio::sync::RwLock::new(Box::new(bs))));
+        for tx in [&queued, &included] {
+            let mut entry = mempool_entry(hex::encode(tx.sender), tx.nonce);
+            entry.hash = hex::encode(tx.hash());
+            state.mempool.write().await.push(entry);
+        }
+        let done = hex::encode([0xCD; 32]);
+        state.tx_results.write().await.insert(
+            done.clone(),
+            TxResult {
+                hash: done.clone(),
+                slot: 7,
+                block_hash: String::new(),
+                status: TxFinalStatus::Finalized,
+                error: None,
+                executed_at: 0,
+            },
+        );
+
+        let call = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(serde_json::json!(1)),
+            method: Some("getSignatureStatuses".into()),
+            params: vec![serde_json::json!([
+                bs58::encode(queued.hash()).into_string(),
+                hex::encode(included.hash()),
+                done,
+                bs58::encode([9u8; 32]).into_string(),
+            ])],
+        };
+        let resp = handle_rpc_call(&Router::new(), &state, call).await;
+        let v = &resp["result"]["value"];
+        assert_eq!(
+            v[0],
+            serde_json::json!({
+                "slot": null,
+                "confirmations": null,
+                "confirmationStatus": "processed",
+                "err": null,
+                "status": null,
+            })
+        );
+        assert_eq!(v[1]["slot"], 42);
+        assert_eq!(v[1]["confirmations"], 0);
+        assert_eq!(v[1]["confirmationStatus"], "processed");
+        assert_eq!(v[2]["slot"], 7);
+        assert_eq!(v[2]["confirmationStatus"], "finalized");
+        assert_eq!(v[2]["status"], serde_json::json!({ "Ok": null }));
+        assert!(v[3].is_null());
+    }
+
+    #[test]
+    fn pending_nonce_skips_nonces_held_by_recent_txs_of_the_sender() {
+        let me = [3u8; 32];
+        let now = IN_FLIGHT_NONCE_TTL_MS + 1_000;
+        assert_eq!(pending_nonce(5, &me, &[], now), 5);
+        let mut pool = vec![
+            mempool_entry(hex::encode(me), 3),
+            mempool_entry(bs58::encode(me).into_string(), 5),
+            mempool_entry(hex::encode(me), 6),
+            mempool_entry(hex::encode([4u8; 32]), 7),
+        ];
+        for e in &mut pool {
+            e.received_at = now;
+        }
+        assert_eq!(pending_nonce(5, &me, &pool, now), 7);
+        assert_eq!(pending_nonce(8, &me, &pool, now), 8);
+
+        // A lost tx stops holding its nonce once stale, so the gap refills.
+        pool[1].received_at = 0;
+        assert_eq!(pending_nonce(5, &me, &pool, now), 5);
+    }
+
+    #[tokio::test]
+    async fn concurrent_airdrops_take_distinct_nonces_and_all_execute() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let genesis_pk = sk.verifying_key().to_bytes();
+        let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+        let mut state = test_state(Vec::new());
+        state.genesis_signing_key = Some(Arc::new(sk));
+        state.tx_sender = Some(tx_send);
+        state
+            .execution_state
+            .write()
+            .await
+            .get_or_create_account(&genesis_pk)
+            .native_balance = 1_000_000;
+
+        let recipients: Vec<[u8; 32]> = (1..=4u8).map(|i| [i; 32]).collect();
+        let statuses = futures::future::join_all(recipients.iter().map(|r| {
+            let state = state.clone();
+            let r = *r;
+            async move {
+                let tx = build_airdrop_tx(&state, r, 1_000).await.unwrap();
+                let req: SubmitTransactionRequest = serde_json::from_value(tx).unwrap();
+                submit_transaction(axum::extract::State(state), Json(req))
+                    .await
+                    .into_response()
+                    .status()
+            }
+        }))
+        .await;
+        assert!(statuses.iter().all(|s| s.is_success()), "{statuses:?}");
+
+        let mut nonces: Vec<u64> = state.mempool.read().await.iter().map(|e| e.nonce).collect();
+        nonces.sort_unstable();
+        assert_eq!(nonces, vec![0, 1, 2, 3]);
+
+        let mut txs = Vec::new();
+        while let Ok(t) = tx_recv.try_recv() {
+            txs.push(t);
+        }
+        txs.sort_by_key(|t| t.nonce);
+        let mut exec = state.execution_state.write().await;
+        let results = exec.execute_block(&txs);
+        assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+        for r in &recipients {
+            assert_eq!(exec.get_account(r).unwrap().native_balance, 1_000);
+        }
+
+        // A later airdrop continues from the finalized nonce plus what is still in flight.
+        drop(exec);
+        let tx = build_airdrop_tx(&state, [9u8; 32], 1).await.unwrap();
+        let req: SubmitTransactionRequest = serde_json::from_value(tx).unwrap();
+        let _ = submit_transaction(axum::extract::State(state.clone()), Json(req)).await;
+        assert_eq!(tx_recv.try_recv().unwrap().nonce, 4);
+    }
+
+    fn finalized_result(hash: &str) -> TxResult {
+        TxResult {
+            hash: hash.to_string(),
+            slot: 1,
+            block_hash: String::new(),
+            status: TxFinalStatus::Finalized,
+            error: None,
+            executed_at: 0,
+        }
+    }
+
+    #[test]
+    fn replay_orders_survivors_by_nonce() {
+        let (a, b) = ([3u8; 32], [4u8; 32]);
+        let mut pool = vec![
+            mempool_entry(hex::encode(a), 4),
+            mempool_entry(hex::encode(b), 1),
+            mempool_entry(hex::encode(a), 2),
+            mempool_entry(hex::encode(a), 3),
+        ];
+        pool[3].received_at = 9;
+        let txs = prune_for_replay(&mut pool, &HashMap::new(), |_| 0);
+        let order: Vec<_> = txs.iter().map(|t| (t.sender, t.nonce)).collect();
+        assert_eq!(order, vec![(b, 1), (a, 2), (a, 3), (a, 4)]);
+        assert_eq!(pool.len(), 4);
+    }
+
+    #[test]
+    fn replay_drops_finalized_and_consumed_nonces() {
+        let (a, b) = ([3u8; 32], [4u8; 32]);
+        let mut pool = vec![
+            mempool_entry(hex::encode(a), 0),
+            mempool_entry(hex::encode(a), 1),
+            mempool_entry(hex::encode(a), 2),
+            mempool_entry(hex::encode(b), 0),
+        ];
+        let finalized = HashMap::from([(pool[0].hash.clone(), finalized_result(&pool[0].hash))]);
+        let txs = prune_for_replay(&mut pool, &finalized, |pk| if pk == &a { 2 } else { 0 });
+        let order: Vec<_> = txs.iter().map(|t| (t.sender, t.nonce)).collect();
+        assert_eq!(order, vec![(b, 0), (a, 2)]);
+        let kept: Vec<_> = pool.iter().map(|e| (e.tx.sender, e.nonce)).collect();
+        assert_eq!(kept, vec![(a, 2), (b, 0)]);
+    }
+
+    #[tokio::test]
+    async fn faucet_resumes_after_reconnect_replay() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let genesis_pk = sk.verifying_key().to_bytes();
+        let (tx_send, mut old_node) = mpsc::unbounded_channel();
+        let mut state = test_state(Vec::new());
+        state.genesis_signing_key = Some(Arc::new(sk));
+        state.tx_sender = Some(tx_send.clone());
+        state
+            .execution_state
+            .write()
+            .await
+            .get_or_create_account(&genesis_pk)
+            .native_balance = 1_000_000;
+
+        for r in 1..=3u8 {
+            let tx = build_airdrop_tx(&state, [r; 32], 1_000).await.unwrap();
+            let req: SubmitTransactionRequest = serde_json::from_value(tx).unwrap();
+            let _ = submit_transaction(axum::extract::State(state.clone()), Json(req)).await;
+        }
+        let mut sent = Vec::new();
+        while let Ok(t) = old_node.try_recv() {
+            sent.push(t);
+        }
+        sent.sort_by_key(|t| t.nonce);
+
+        // Nonce 0 finalizes, then the link drops and the node mempool loses 1 and 2.
+        let order = Arc::new(tokio::sync::RwLock::new(VecDeque::new()));
+        let first = state
+            .execution_state
+            .write()
+            .await
+            .execute_block(&sent[..1]);
+        record_tx_results(
+            &state.mempool,
+            &state.tx_results,
+            &order,
+            1,
+            "",
+            &sent[..1],
+            &first,
+        )
+        .await;
+
+        let (new_send, mut new_node) = mpsc::unbounded_channel();
+        state.tx_sender = Some(new_send.clone());
+        let replayed = replay_in_flight(
+            &state.mempool,
+            &state.tx_results,
+            &state.execution_state,
+            &new_send,
+        )
+        .await;
+        assert_eq!(replayed, 2);
+        let tx = build_airdrop_tx(&state, [9u8; 32], 1_000).await.unwrap();
+        let req: SubmitTransactionRequest = serde_json::from_value(tx).unwrap();
+        let _ = submit_transaction(axum::extract::State(state.clone()), Json(req)).await;
+
+        let mut delivered = Vec::new();
+        while let Ok(t) = new_node.try_recv() {
+            delivered.push(t);
+        }
+        assert_eq!(
+            delivered.iter().map(|t| t.nonce).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let results = state
+            .execution_state
+            .write()
+            .await
+            .execute_block(&delivered);
+        assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_polling_and_finalization_do_not_deadlock() {
+        let state = test_state(Vec::new());
+        let order = Arc::new(tokio::sync::RwLock::new(VecDeque::new()));
+        let run = async {
+            for round in 0..200u64 {
+                let txs: Vec<CoreTransaction> = (0..8)
+                    .map(|i| CoreTransaction {
+                        nonce: round * 8 + i,
+                        ..make_core_tx(TransactionBody::Transfer {
+                            to: [0x01; 32],
+                            amount: 1,
+                        })
+                    })
+                    .collect();
+                for tx in &txs {
+                    let mut entry = mempool_entry(hex::encode(tx.sender), tx.nonce);
+                    entry.hash = hex::encode(tx.hash());
+                    state.mempool.write().await.push(entry);
+                }
+                let ids: Vec<String> = txs.iter().map(|t| hex::encode(t.hash())).collect();
+                let pollers: Vec<_> = (0..4)
+                    .map(|_| {
+                        let state = state.clone();
+                        let ids = ids.clone();
+                        tokio::spawn(async move {
+                            for _ in 0..8 {
+                                let call = JsonRpcRequest {
+                                    jsonrpc: Some("2.0".into()),
+                                    id: Some(serde_json::json!(1)),
+                                    method: Some("getSignatureStatuses".into()),
+                                    params: vec![serde_json::json!(ids)],
+                                };
+                                let _ = handle_rpc_call(&Router::new(), &state, call).await;
+                                let _ = get_transaction(
+                                    Path(ids[0].clone()),
+                                    axum::extract::State(state.clone()),
+                                )
+                                .await;
+                            }
+                        })
+                    })
+                    .collect();
+                for tx in &txs {
+                    record_tx_results(
+                        &state.mempool,
+                        &state.tx_results,
+                        &order,
+                        round,
+                        "",
+                        std::slice::from_ref(tx),
+                        &[Ok(())],
+                    )
+                    .await;
+                    tokio::task::yield_now().await;
+                }
+                for p in pollers {
+                    p.await.unwrap();
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("status polling deadlocked against record_tx_results");
+        assert!(state.mempool.read().await.is_empty());
+        assert_eq!(state.tx_results.read().await.len(), 1600);
+    }
 }
 
 // Solana-style JSON-RPC adapter; methods dispatch through REST handlers.
@@ -3093,6 +3632,82 @@ async fn build_airdrop_tx(
         "signature": hex::encode([0u8; 64]),
         "body": { "Transfer": { "to": hex::encode(recipient), "amount": amount } },
     }))
+}
+
+fn finalized_signature_status(res: &TxResult) -> serde_json::Value {
+    let err = match res.status {
+        TxFinalStatus::Finalized => serde_json::Value::Null,
+        TxFinalStatus::Failed => serde_json::json!({
+            "message": res.error.clone().unwrap_or_default()
+        }),
+    };
+    serde_json::json!({
+        "slot": res.slot,
+        "confirmations": serde_json::Value::Null,
+        "confirmationStatus": "finalized",
+        "err": err,
+        "status": if err.is_null() {
+            serde_json::json!({ "Ok": null })
+        } else {
+            serde_json::json!({ "Err": err })
+        },
+    })
+}
+
+/// Not executed yet, so `status` stays null; `slot` is the including block's slot, if any.
+fn processed_signature_status(included_slot: Option<u64>) -> serde_json::Value {
+    serde_json::json!({
+        "slot": included_slot,
+        "confirmations": included_slot.map(|_| 0),
+        "confirmationStatus": "processed",
+        "err": serde_json::Value::Null,
+        "status": serde_json::Value::Null,
+    })
+}
+
+/// Slots of not-yet-executed canonical blocks that include any of `hashes`.
+async fn find_inclusion_slots<V>(
+    state: &SharedState,
+    hashes: &HashMap<String, V>,
+) -> HashMap<String, u64> {
+    let mut found = HashMap::new();
+    let Some(bs_arc) = state.blockstore.as_ref() else {
+        return found;
+    };
+    let highest_mem_slot = state
+        .blocks
+        .read()
+        .await
+        .iter()
+        .map(|b| b.slot())
+        .max()
+        .unwrap_or(0);
+    let finalized = current_slot(state).await;
+    let top = highest_mem_slot.max(finalized) + 200;
+    // Execution trails finalization, so recently finalized blocks may still hold them.
+    let floor = finalized.saturating_sub(500);
+    let bs = bs_arc.read().await;
+    for slot_u64 in (floor..=top).rev() {
+        let slot = Slot::new(slot_u64);
+        let Some(blk_hash) = bs.canonical_block_hash(slot) else {
+            continue;
+        };
+        let Some(blk) = bs.get_block(&(slot, blk_hash.into())) else {
+            continue;
+        };
+        for raw_tx in blk.transactions() {
+            if let Some(core_tx) = decode_raw_transaction(raw_tx) {
+                let tx_hash = hex::encode(core_tx.hash());
+                if hashes.contains_key(&tx_hash) {
+                    found.entry(tx_hash).or_insert(slot_u64);
+                }
+            }
+        }
+        if found.len() == hashes.len() {
+            break;
+        }
+    }
+    found
 }
 
 fn param_str(params: &[serde_json::Value], i: usize) -> Result<&str, ()> {
@@ -3299,49 +3914,36 @@ async fn handle_rpc_call(
             let slot = current_slot(state).await;
             Ok(Ok(ctx_value(slot, serde_json::json!(RECOMMENDED_TX_FEE))))
         }
-        // Mempool maps to processed; executed finalized blocks map to finalized.
+        // Executed finalized blocks map to finalized; anything still in flight is processed,
+        // with a slot only once a block includes it.
         "getSignatureStatuses" => match p.first().and_then(|v| v.as_array()) {
             Some(ids) => {
                 let slot = current_slot(state).await;
-                let results = state.tx_results.read().await;
-                let mempool = state.mempool.read().await;
-                let statuses: Vec<serde_json::Value> = ids
-                    .iter()
-                    .map(|idv| {
+                let mut statuses = vec![serde_json::Value::Null; ids.len()];
+                let mut in_flight: HashMap<String, Vec<usize>> = HashMap::new();
+                {
+                    let mempool = state.mempool.read().await;
+                    let results = state.tx_results.read().await;
+                    for (i, idv) in ids.iter().enumerate() {
                         let Some(hex_id) = idv.as_str().and_then(|s| tx_id_to_hex(s).ok()) else {
-                            return serde_json::Value::Null;
+                            continue;
                         };
                         if let Some(res) = results.get(&hex_id) {
-                            let err = match res.status {
-                                TxFinalStatus::Finalized => serde_json::Value::Null,
-                                TxFinalStatus::Failed => serde_json::json!({
-                                    "message": res.error.clone().unwrap_or_default()
-                                }),
-                            };
-                            return serde_json::json!({
-                                "slot": res.slot,
-                                "confirmations": serde_json::Value::Null,
-                                "confirmationStatus": "finalized",
-                                "err": err,
-                                "status": if err.is_null() {
-                                    serde_json::json!({ "Ok": null })
-                                } else {
-                                    serde_json::json!({ "Err": err })
-                                },
-                            });
+                            statuses[i] = finalized_signature_status(res);
+                        } else if mempool.iter().any(|e| e.hash == hex_id) {
+                            in_flight.entry(hex_id).or_default().push(i);
                         }
-                        if mempool.iter().any(|e| e.hash == hex_id) {
-                            return serde_json::json!({
-                                "slot": slot,
-                                "confirmations": 0,
-                                "confirmationStatus": "processed",
-                                "err": serde_json::Value::Null,
-                                "status": { "Ok": null },
-                            });
+                    }
+                }
+                if !in_flight.is_empty() {
+                    let included = find_inclusion_slots(state, &in_flight).await;
+                    for (hash, positions) in &in_flight {
+                        let status = processed_signature_status(included.get(hash).copied());
+                        for &i in positions {
+                            statuses[i] = status.clone();
                         }
-                        serde_json::Value::Null
-                    })
-                    .collect();
+                    }
+                }
                 Ok(Ok(ctx_value(slot, serde_json::json!(statuses))))
             }
             None => Err(()),
@@ -3489,16 +4091,66 @@ async fn jsonrpc_handler(
     Json(handle_rpc_call(&rest, &state, parsed).await)
 }
 
+const CORS_ORIGINS: &[&str] = &[
+    "https://bunkercoin.com",
+    "https://www.bunkercoin.com",
+    "https://wallet.bunkercoin.com",
+    "https://explorer.bunkercoin.com",
+    "https://app.bunkercoin.com",
+];
+
+/// Extra exact origins from `BUNKER_CORS_ORIGINS` (comma-separated).
+fn cors_extra_origins(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|o| o.trim().trim_end_matches('/'))
+        .filter(|o| !o.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Exact allowlist, `https` on bunkercoin.io hosts, and `http` on loopback with any port.
+fn cors_origin_allowed(origin: &str, extra: &[String]) -> bool {
+    if CORS_ORIGINS.contains(&origin) || extra.iter().any(|o| o == origin) {
+        return true;
+    }
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if port.is_some_and(|p| p.parse::<u16>().is_err()) {
+        return false;
+    }
+    let is_label = |l: &str| {
+        !l.is_empty()
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    match scheme {
+        "http" => host == "localhost" || host == "127.0.0.1",
+        "https" => {
+            port.is_none()
+                && (host == "bunkercoin.io"
+                    || host
+                        .strip_suffix(".bunkercoin.io")
+                        .is_some_and(|sub| sub.split('.').all(is_label)))
+        }
+        _ => false,
+    }
+}
+
 pub async fn run_api(state: SharedState) {
+    let extra_origins =
+        cors_extra_origins(&std::env::var("BUNKER_CORS_ORIGINS").unwrap_or_default());
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
         .allow_headers(Any)
-        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
-            if let Ok(o) = origin.to_str() {
-                o.starts_with("http://localhost") || o.ends_with(".bunkercoin.io")
-            } else {
-                false
-            }
+        .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {
+            origin
+                .to_str()
+                .is_ok_and(|o| cors_origin_allowed(o, &extra_origins))
         }));
     let app = Router::new()
         .route("/blocks", get(blocks))
@@ -3544,6 +4196,10 @@ pub async fn run_api(state: SharedState) {
             return;
         }
     };
+    let bound = listener
+        .local_addr()
+        .map_or(bind_addr, |addr| addr.to_string());
+    println!("RPC API serving on http://{bound} (try /blocks, POST /transactions)");
     if let Err(err) = axum::serve(listener, app).await {
         eprintln!("API server stopped with error: {err}");
     }
