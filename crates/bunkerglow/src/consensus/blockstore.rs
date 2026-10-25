@@ -167,7 +167,10 @@ impl BlockstoreImpl {
                 let hash = block_info.hash.as_hash().clone();
                 let block_id = (*slot, block_info.hash.clone());
                 if let Some(block) = self.get_block(&block_id) {
-                    self.persist_block(*slot, &hash, &block);
+                    let first_shred_at = self
+                        .get_block_data(&block_id)
+                        .and_then(|d| d.first_shred_at);
+                    self.persist_block(*slot, &hash, &block, first_shred_at);
                     self.persist_repair_data(&block_id);
                 }
 
@@ -180,7 +183,9 @@ impl BlockstoreImpl {
     }
 
     /// Persists a completed block and base metadata; finalization fills timestamp later.
-    fn persist_block(&self, slot: Slot, hash: &Hash, block: &Block) {
+    /// `proposed_timestamp` is the first shred's arrival: priority-lane votes overtake
+    /// the shreds, so a follower can finalize the instant it completes the block.
+    fn persist_block(&self, slot: Slot, hash: &Hash, block: &Block, first_shred_at: Option<u64>) {
         let key = format!("{:016X}{}", slot, hex::encode(hash));
         if let Ok(value) = bincode::serde::encode_to_vec(block, bincode::config::standard()) {
             let _ = self.db.put(key.as_bytes(), value);
@@ -195,7 +200,7 @@ impl BlockstoreImpl {
                 slot,
                 hash: hash.clone(),
                 producer: self.epoch_info.leader(slot).id,
-                proposed_timestamp: now,
+                proposed_timestamp: first_shred_at.unwrap_or(now),
                 finalized_timestamp: None,
             };
             let meta_key = format!("meta|{:016X}{}", slot, hex::encode(hash));

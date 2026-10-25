@@ -154,6 +154,8 @@ pub struct BlockData {
     pub(super) double_merkle_tree: Option<DoubleMerkleTree>,
     /// Cache of Merkle roots for which the leader signature has been verified.
     pub(super) merkle_root_cache: BTreeMap<SliceIndex, SliceRoot>,
+    /// Local wall-clock millis when the first shred of this block was stored.
+    pub(super) first_shred_at: Option<u64>,
 }
 
 impl BlockData {
@@ -167,6 +169,7 @@ impl BlockData {
             last_slice: None,
             double_merkle_tree: None,
             merkle_root_cache: BTreeMap::new(),
+            first_shred_at: None,
         }
     }
 
@@ -225,6 +228,11 @@ impl BlockData {
             return Err(AddShredError::Duplicate);
         }
         slice_shreds[*shred_index] = Some(validated_shred);
+        self.first_shred_at.get_or_insert_with(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64)
+        });
 
         if is_first_shred {
             return Ok(Some(VotorEvent::FirstShred(self.slot)));
@@ -492,6 +500,25 @@ mod tests {
         assert_eq!(events.len(), 1);
         let first_shred_event = VotorEvent::FirstShred(slot);
         assert_votor_events_match(events[0].clone(), first_shred_event);
+    }
+
+    #[test]
+    fn first_shred_time_is_kept_through_completion() {
+        let sk = SecretKey::new(&mut rand::rng());
+        let slot = Slot::new(123);
+        let slices = create_random_block(slot, 2);
+        let mut block_data = BlockData::new(slot);
+        assert_eq!(block_data.first_shred_at, None);
+
+        let (_, res) = handle_slice(&mut block_data, slices[0].clone(), &sk);
+        let () = res.unwrap();
+        let first = block_data.first_shred_at.expect("stamped on first shred");
+        block_data.first_shred_at = Some(first - 5_000);
+
+        let (events, res) = handle_slice(&mut block_data, slices[1].clone(), &sk);
+        let () = res.unwrap();
+        assert!(events.iter().any(|e| matches!(e, VotorEvent::Block { .. })));
+        assert_eq!(block_data.first_shred_at, Some(first - 5_000));
     }
 
     /// A parent slot not strictly earlier than its own slot must reject as

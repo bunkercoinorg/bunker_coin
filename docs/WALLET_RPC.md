@@ -108,15 +108,18 @@ Batch arrays supported. `RpcResponse` means Solana's
 | `getMinimumBalanceForRentExemption` | `[size]` | `0` (no rent) |
 | `sendTransaction` | `[base64Tx]` or `[txObject]` | base58 tx id |
 | `simulateTransaction` | `[base64Tx]` or `[txObject]` | RpcResponse\<{err: null\|{message}, logs, unitsConsumed}\> |
-| `getSignatureStatuses` | `[[id, …]]` | RpcResponse\<[status\|null, …]\>; status = `{slot, confirmations, confirmationStatus: "processed"\|"finalized", err, status}` |
+| `getSignatureStatuses` | `[[id, …]]` | RpcResponse\<[status\|null, …]\>; status = `{slot, confirmations, confirmationStatus: "processed"\|"finalized", err, status}`; `processed` has `slot: null` and `status: null` until a block includes it, then that block's slot |
 | `requestAirdrop` | `[pubkey, amount]` | base58 tx id (nodes with the genesis key only) |
 | `getTokenAccountsByOwner` | `[pubkey]` | RpcResponse\<token balances\> |
 | `getTransaction` | `[id]` | transaction detail |
 | `getBlock` / `getBlocks` | `[slot]` / `[limit, offset]` | block(s) |
 
 Commitment note: BunkerCoin has no observable "confirmed" middle state —
-a transaction is `processed` (in mempool) and then `finalized` (executed in a
-finalized block). Wallets that wait for `confirmed` should treat `finalized`
+a transaction is `processed` (accepted by the node, not yet executed) and then
+`finalized` (executed in a finalized block). A `processed` entry carries
+`slot: null` while it waits in the mempool and the including block's slot once
+proposed; its `status` is `null` because nothing has executed yet, and `err` is
+`null`. `null` instead of a status entry means the node does not know the id. Wallets that wait for `confirmed` should treat `finalized`
 as satisfying it.
 
 Radio-latency note: finality normally lands seconds after submission when the
